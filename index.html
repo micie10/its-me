@@ -1447,14 +1447,183 @@
   });
 
   // ---------- export ----------
-  document.getElementById('exportBtn').addEventListener('click', function(){
+  // background-image(배너/아바타/갤러리/세로이미지 박스)는 html2canvas가
+  // "scale" 옵션과 무관하게 저해상도로 래스터화하는 한계가 있어, 그대로
+  // 캡처하면 다른 요소보다 화질이 크게 떨어진다. 이를 피하기 위해
+  // 캡처 직전(onclone)에 각 background-image를 "현재 화면에 보이는 대로"
+  // (scale/x/y 조정 상태 또는 cover/center 포함) 최종 해상도에 맞는
+  // 오프스크린 캔버스에 다시 그려 고해상도 데이터URL로 치환한다.
+  // 큰 원본 이미지를 한 번에 크게 축소(drawImage)하면 브라우저 캔버스의
+  // 스무딩 알고리즘이 고주파 디테일(머리카락 등)에서 계단현상/무아레를
+  // 만들어낸다. 이를 피하기 위해 원본을 목표 크기의 2배가 될 때까지
+  // 절반씩 단계적으로 축소(step-down resizing)한 뒤 마지막에 정확한
+  // 크기로 그린다. 축소율이 클수록(작은 박스일수록) 효과가 크다.
+  function cropBackgroundToBox(imgSrc, boxW, boxH, targetW, targetH, sizeMode, scalePercent, posXPercent, posYPercent){
+    return new Promise(function(resolve, reject){
+      var img = new Image();
+      img.onload = function(){
+        var dW, dH;
+        if(sizeMode === 'cover'){
+          var coverScale = Math.max(boxW / img.naturalWidth, boxH / img.naturalHeight);
+          dW = img.naturalWidth * coverScale;
+          dH = img.naturalHeight * coverScale;
+        } else {
+          dW = boxW * (scalePercent / 100);
+          dH = dW * (img.naturalHeight / img.naturalWidth);
+        }
+        var dX = (boxW - dW) * (posXPercent / 100);
+        var dY = (boxH - dH) * (posYPercent / 100);
+        var ratio = targetW / boxW;
+
+        // 최종적으로 그려질 이미지의 픽셀 크기(전체 원본 기준, 크롭 전)
+        var finalDrawW = dW * ratio;
+        var finalDrawH = dH * ratio;
+
+        // 원본을 소스로, 필요하면 절반씩 줄여가며 finalDraw 크기의 2배
+        // 이내로 맞춘 중간 소스를 만든다.
+        var src = img;
+        var srcW = img.naturalWidth, srcH = img.naturalHeight;
+        var guard = 0;
+        while(srcW > finalDrawW * 2 && srcH > finalDrawH * 2 && guard < 8){
+          var stepW = Math.max(Math.round(srcW / 2), Math.round(finalDrawW));
+          var stepH = Math.max(Math.round(srcH / 2), Math.round(finalDrawH));
+          var stepCanvas = document.createElement('canvas');
+          stepCanvas.width = stepW;
+          stepCanvas.height = stepH;
+          var stepCtx = stepCanvas.getContext('2d');
+          stepCtx.imageSmoothingEnabled = true;
+          stepCtx.imageSmoothingQuality = 'high';
+          stepCtx.drawImage(src, 0, 0, srcW, srcH, 0, 0, stepW, stepH);
+          src = stepCanvas;
+          srcW = stepW; srcH = stepH;
+          guard++;
+        }
+
+        var canvas = document.createElement('canvas');
+        canvas.width = targetW;
+        canvas.height = targetH;
+        var ctx = canvas.getContext('2d');
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        // drawImage의 4-인자 형태는 src 전체를 목적지 사각형에 맞춰 그리므로,
+        // src가 원본이든 단계적으로 축소된 중간본이든 목적지 좌표(dX*ratio 등)는
+        // 그대로 사용한다. 소스가 이미 작아졌어도 최종 위치/크기는 동일해야 한다.
+        ctx.drawImage(src, dX * ratio, dY * ratio, dW * ratio, dH * ratio);
+        resolve(canvas.toDataURL('image/png'));
+      };
+      img.onerror = reject;
+      img.src = imgSrc;
+    });
+  }
+
+  document.getElementById('exportBtn').addEventListener('click', async function(){
     var target = document.getElementById('capture-area');
     var wasSelected = selectedEl;
     deselectAll();
     document.body.classList.add('exporting');
 
-    html2canvas(target, { backgroundColor: null, scale: 2, useCORS: true }).then(function(canvasResult){
+    var btn = document.getElementById('exportBtn');
+    var prevBtnText = btn.textContent;
+    btn.textContent = '저장 중…';
+    btn.disabled = true;
+
+    // index.html과 동일하게, 캡처 전 웹폰트 로딩 완료를 기다려
+    // 폴백 폰트로 캡처되는 것을 방지한다.
+    if (document.fonts && document.fonts.ready) {
+      try { await document.fonts.ready; } catch (e) {}
+    }
+
+    // 카드 크기에 맞춰 (브라우저 캔버스 한계 내에서) 최대한 큰 배율로 캡처.
+    // 고정 배율(예: scale:2)은 카드가 작을 때 화질을 불필요하게 낮추고,
+    // 반대로 너무 큰 고정값은 큰 카드에서 캔버스 한계에 걸려 오히려
+    // 더 흐려질 수 있어 동적으로 계산한다.
+    // 데스크톱 전용 사용을 전제로, index.html과 동일하게 "최소 2배"를
+    // 보장하고, 여유 있는 상한 내에서 더 높은 배율(최대 4배)까지 시도한다.
+    var DESIRED_SCALE = 4;
+    var MIN_SCALE = 2;             // index.html과 동일한 최소 보장 배율
+    var MAX_DIMENSION_PX = 8192;   // 데스크톱 기준 여유 있는 상한
+    var MAX_AREA_PX = 40000000;
+    var rect = target.getBoundingClientRect();
+    var exportScale = DESIRED_SCALE;
+    exportScale = Math.min(exportScale, MAX_DIMENSION_PX / rect.width, MAX_DIMENSION_PX / rect.height);
+    if(rect.width * rect.height * exportScale * exportScale > MAX_AREA_PX){
+      exportScale = Math.sqrt(MAX_AREA_PX / (rect.width * rect.height));
+    }
+    exportScale = Math.max(MIN_SCALE, Math.min(DESIRED_SCALE, exportScale));
+
+    html2canvas(target, {
+      backgroundColor: null,
+      scale: exportScale,
+      useCORS: true,
+      allowTaint: true,
+      imageTimeout: 0,
+      logging: false,
+      onclone: function(doc, clonedTarget){
+        var bgEls = Array.prototype.slice.call(clonedTarget.querySelectorAll('.has-image'));
+        return Promise.all(bgEls.map(function(el){
+          var bgImage = el.style.backgroundImage;
+          var m = bgImage && bgImage.match(/url\((['"]?)(.*?)\1\)/);
+          if(!m) return Promise.resolve();
+          var src = m[2];
+          var box = el.getBoundingClientRect();
+          var boxW = box.width, boxH = box.height;
+          if(!boxW || !boxH) return Promise.resolve();
+
+          var sizeStyle = (el.style.backgroundSize || 'cover').trim();
+          var posStyle = (el.style.backgroundPosition || '50% 50%').trim();
+
+          var sizeMode = 'scale', scalePercent = 100;
+          if(sizeStyle === 'cover'){
+            sizeMode = 'cover';
+          } else {
+            var sm = sizeStyle.match(/([\d.]+)%/);
+            scalePercent = sm ? parseFloat(sm[1]) : 100;
+          }
+
+          var posXPercent = 50, posYPercent = 50;
+          if(posStyle !== 'center'){
+            var pm = posStyle.match(/([\d.]+)%\s+([\d.]+)%/);
+            if(pm){ posXPercent = parseFloat(pm[1]); posYPercent = parseFloat(pm[2]); }
+          }
+
+          // 작은 박스(아바타, 갤러리 썸네일 등)는 전체 exportScale만 적용하면
+          // 최종 픽셀 수가 적어 디테일이 뭉개지기 쉽다. 박스가 작을수록
+          // 추가 배율(최대 2배)을 얹어 더 높은 해상도로 렌더링한 뒤,
+          // 데이터 용량/성능 보호를 위해 한 변 기준 절대 픽셀 상한을 둔다.
+          var SMALL_BOX_THRESHOLD = 160; // 이 CSS px보다 작은 박스만 부스트 대상
+          var MAX_BOOST = 2;
+          var boostFactor = 1;
+          var minSide = Math.min(boxW, boxH);
+          if(minSide < SMALL_BOX_THRESHOLD){
+            boostFactor = Math.min(MAX_BOOST, SMALL_BOX_THRESHOLD / minSide);
+          }
+          var effectiveScale = exportScale * boostFactor;
+
+          var targetW = Math.max(1, Math.round(boxW * effectiveScale));
+          var targetH = Math.max(1, Math.round(boxH * effectiveScale));
+
+          var MAX_ELEMENT_PX = 900; // 요소 하나당 한 변 픽셀 상한 (성능/용량 보호)
+          if(targetW > MAX_ELEMENT_PX || targetH > MAX_ELEMENT_PX){
+            var capRatio = Math.min(MAX_ELEMENT_PX / targetW, MAX_ELEMENT_PX / targetH);
+            targetW = Math.max(1, Math.round(targetW * capRatio));
+            targetH = Math.max(1, Math.round(targetH * capRatio));
+          }
+
+          return cropBackgroundToBox(src, boxW, boxH, targetW, targetH, sizeMode, scalePercent, posXPercent, posYPercent)
+            .then(function(dataUrl){
+              el.style.backgroundImage = 'url(' + dataUrl + ')';
+              el.style.backgroundSize = 'cover';
+              el.style.backgroundPosition = 'center';
+            })
+            .catch(function(err){
+              console.error('이미지 고화질 처리 실패, 기존 상태로 내보냅니다.', err);
+            });
+        }));
+      }
+    }).then(function(canvasResult){
       document.body.classList.remove('exporting');
+      btn.textContent = prevBtnText;
+      btn.disabled = false;
       if(wasSelected){ selectElement(wasSelected); }
 
       var link = document.createElement('a');
@@ -1463,6 +1632,8 @@
       link.click();
     }).catch(function(err){
       document.body.classList.remove('exporting');
+      btn.textContent = prevBtnText;
+      btn.disabled = false;
       alert('PNG 저장 중 문제가 발생했습니다: ' + err);
     });
   });
